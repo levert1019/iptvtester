@@ -1,0 +1,80 @@
+# =========================
+# IPTV Tester – CONFIG FILE
+# =========================
+
+# -------- INPUT / OUTPUT --------
+SOURCE_M3U: "input\\playlist.m3u"
+
+OUTPUTS:
+  OK_M3U:   "output\\ok.m3u"
+  FAIL_M3U: "output\\fail.m3u"
+  OK_XLSX:  "output\\ok.xlsx"
+  FAIL_XLSX:"output\\fail.xlsx"
+  DB_PATH:  "output\\inventory.sqlite3"
+
+# -------- PROBING (ffprobe) --------
+PROBE:
+  PARALLELISM: 48
+  TIMEOUT_SECONDS: 12
+  SHOW_EACH_PROBE: false
+
+# -------- GROUP FILTERS --------
+GROUP_FILTERS:
+  PROCESS_ONLY_INCLUDED_GROUPS: true     # false = test whole playlist
+  INCLUDE_GROUPS: []
+  EXCLUDE_GROUPS: []
+
+# -------- TMDB ENRICHMENT --------
+TMDB:
+  ENABLE: true
+  API_KEY: ""            # your TMDB API key
+  LANGUAGE: "en-US"      # affects prefix: "en-US" -> "EN"
+  USE_MULTI_SEARCH: true
+  PARALLELISM: 24
+  TIMEOUT_SECONDS: 8
+  RETRIES: 2
+  RATE_LIMIT_RPS: 50
+  HTTP2: false           # if true and httpx installed, use HTTP/2 for TMDB
+  CACHE_DB_PATH: "output\\tmdb_cache.sqlite3"
+  APPLY_GENRE_GROUPING: true   # NEW: set group-title to "PREFIX - Genre" or "PREFIX - Uncategorized"
+
+# -------- EXCEL EXPORT --------
+EXCEL:
+  ENGINE: "xlsxwriter"
+  MINIMAL_STYLE: true
+  AUTOFIT_MAX: 60
+  ADD_CSV_TOO: false
+
+# -------- DOWNLOADER --------
+DOWNLOAD:
+  SAVE_COPY: true
+  DIR: "input"
+  FILENAME_PREFIX: "playlist_dl_"
+
+HTTP:
+  TIMEOUT_SECONDS: 25
+  RETRIES: 3
+  VERIFY_TLS: true
+  DEFAULT_UA: "VLC/3.0.18 LibVLC/3.0.18"
+  ACCEPT_LANGUAGE: "en-US,en;q=0.9"
+  UA_ROTATE:
+    - "VLC/3.0.18 LibVLC/3.0.18"
+    - "Dalvik/2.1.0 (Linux; U; Android 9; IPTV Smarters Pro)"
+    - "Kodi/20.0 (Windows NT 10.0; Win64; x64)"
+    - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36"
+  ACCEPT_STATUSES: [200, 206, 884]
+  QUERY_AUTOVARIANTS:
+    - "type=m3u_plus&output=ts"
+    - "type=m3u_plus&output=m3u8"
+    - "type=m3u&output=ts"
+    - "type=m3u&output=m3u8"
+  DEBUG_DUMP: true
+
+# -------- LOGGING / MISC --------
+MISC:
+  QUIET: false
+
+# -------- ADVANCED --------
+ADVANCED:
+  REBUILD_INDEXES: false
+  MIGRATE_STREAMS_NO_ROWID: false
