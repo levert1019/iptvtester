@@ -1,80 +1,134 @@
 # =========================
-# IPTV Tester – CONFIG FILE
+# IPTV-Tester – config.yaml
 # =========================
+# All paths are relative to the project root unless you use absolute paths.
 
-# -------- INPUT / OUTPUT --------
-SOURCE_M3U: "input\\playlist.m3u"
+# --- Where to load the playlist from ---
+# Accepts:
+#   • Local file path  -> e.g. "input/playlist.m3u"
+#   • HTTP/HTTPS URL   -> e.g. "https://example.com/get.php?...&type=m3u_plus"
+SOURCE_M3U: "input/playlist.m3u"
 
-OUTPUTS:
-  OK_M3U:   "output\\ok.m3u"
-  FAIL_M3U: "output\\fail.m3u"
-  OK_XLSX:  "output\\ok.xlsx"
-  FAIL_XLSX:"output\\fail.xlsx"
-  DB_PATH:  "output\\inventory.sqlite3"
 
-# -------- PROBING (ffprobe) --------
-PROBE:
-  PARALLELISM: 48
-  TIMEOUT_SECONDS: 12
-  SHOW_EACH_PROBE: false
-
-# -------- GROUP FILTERS --------
-GROUP_FILTERS:
-  PROCESS_ONLY_INCLUDED_GROUPS: true     # false = test whole playlist
-  INCLUDE_GROUPS: []
-  EXCLUDE_GROUPS: []
-
-# -------- TMDB ENRICHMENT --------
-TMDB:
-  ENABLE: true
-  API_KEY: ""            # your TMDB API key
-  LANGUAGE: "en-US"      # affects prefix: "en-US" -> "EN"
-  USE_MULTI_SEARCH: true
-  PARALLELISM: 24
-  TIMEOUT_SECONDS: 8
-  RETRIES: 2
-  RATE_LIMIT_RPS: 50
-  HTTP2: false           # if true and httpx installed, use HTTP/2 for TMDB
-  CACHE_DB_PATH: "output\\tmdb_cache.sqlite3"
-  APPLY_GENRE_GROUPING: true   # NEW: set group-title to "PREFIX - Genre" or "PREFIX - Uncategorized"
-
-# -------- EXCEL EXPORT --------
-EXCEL:
-  ENGINE: "xlsxwriter"
-  MINIMAL_STYLE: true
-  AUTOFIT_MAX: 60
-  ADD_CSV_TOO: false
-
-# -------- DOWNLOADER --------
-DOWNLOAD:
-  SAVE_COPY: true
-  DIR: "input"
-  FILENAME_PREFIX: "playlist_dl_"
-
+# --- HTTP download behavior for SOURCE_M3U (only used when SOURCE_M3U is a URL) ---
 HTTP:
-  TIMEOUT_SECONDS: 25
-  RETRIES: 3
+  # Verify TLS certificates for HTTPS downloads. Set false only if your source uses
+  # broken/self-signed certs and you understand the risk.
   VERIFY_TLS: true
-  DEFAULT_UA: "VLC/3.0.18 LibVLC/3.0.18"
-  ACCEPT_LANGUAGE: "en-US,en;q=0.9"
-  UA_ROTATE:
+
+  # Request timeout for downloading the M3U (seconds).
+  TIMEOUT_SECONDS: 15
+
+  # How many attempts in total before we give up downloading the M3U.
+  RETRIES: 4
+
+  # Sleep between retries (seconds). Backoff is linear in this version.
+  RETRY_BACKOFF_SECONDS: 1.0
+
+  # Optional Referer header some panels expect. Leave empty to omit.
+  REFERER: ""
+
+  # Try these User-Agents in order until one works. Add/remove as you need.
+  USER_AGENTS:
     - "VLC/3.0.18 LibVLC/3.0.18"
     - "Dalvik/2.1.0 (Linux; U; Android 9; IPTV Smarters Pro)"
     - "Kodi/20.0 (Windows NT 10.0; Win64; x64)"
     - "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36"
-  ACCEPT_STATUSES: [200, 206, 884]
-  QUERY_AUTOVARIANTS:
-    - "type=m3u_plus&output=ts"
-    - "type=m3u_plus&output=m3u8"
-    - "type=m3u&output=ts"
-    - "type=m3u&output=m3u8"
-  DEBUG_DUMP: true
 
-# -------- LOGGING / MISC --------
+  # Extra headers merged into the request. Keys as-is; values are strings.
+  EXTRA_HEADERS: {}
+
+
+# --- Select which groups to process from the playlist ---
+GROUP_FILTERS:
+  # true  = process *only* groups that match INCLUDE_GROUPS (if list is non-empty).
+  # false = process the whole playlist, then drop anything that matches EXCLUDE_GROUPS.
+  PROCESS_ONLY_INCLUDED_GROUPS: true
+
+  # Case-insensitive substring match against the stream's original group-title.
+  # Examples provided—replace with your own. You can put empty [] to mean “no include filter”.
+  INCLUDE_GROUPS:
+    - "|EN| 4K SERIES"
+    - "|EXYU| STRANI FILMOVI 1950-2021"
+
+  # Any stream whose group-title contains one of these will be skipped.
+  EXCLUDE_GROUPS:
+    - "|ADULT|"
+    - "XXX"
+
+
+# --- Probing (ffprobe) rules and cadence ---
+PROBE:
+  # Parallel ffprobe workers. Higher is faster but heavier on CPU and the provider.
+  PARALLELISM: 48
+
+  # ffprobe timeout per URL (seconds). Keep it short so dead streams don’t block runs.
+  TIMEOUT_SECONDS: 8
+
+  # How often to re-probe streams that were previously OK (hours).
+  OK_RECHECK_HOURS: 24
+
+  # How often to retry streams that were previously FAIL (minutes).
+  FAIL_RETRY_MINUTES: 30
+
+  # Optional cap on how many URLs to probe per run. 0 = no cap.
+  MAX_PER_RUN: 0
+
+
+# --- TMDB enrichment (canonical names, posters, and genre → final group) ---
+TMDB:
+  # Turn TMDB step on/off entirely.
+  ENABLE: true
+
+  # Your TMDB v3 API key. If ENABLE is true and this is empty, the app will print a clear
+  # error and skip enrichment (everything falls back to "|PREFIX| - Uncategorized").
+  API_KEY: "78626a1ff6b35a1664dedb2920069f10"
+
+  # Language for search + details ("en-US", "de-DE", "hr-HR", etc.).
+  LANGUAGE: "en-US"
+
+  # How many parallel lookups we do. Keep within TMDB’s rate guidance.
+  PARALLELISM: 32
+
+  # Where to store the persistent TMDB cache database (genres + per-series occurrence cache).
+  CACHE_DB_PATH: "output/tmdb_cache.sqlite"
+
+  # Also enrich FAIL streams (recommended). This keeps series mapping consistent across runs.
+  ENRICH_FAILS: true
+
+  # Print TMDB debug counters (useful when tuning).
+  DEBUG_STATS: true
+
+
+# --- Output file locations ---
+OUTPUTS:
+  # Main inventory DB that tracks every URL ever seen + status + last checks.
+  DB_PATH: "output/inventory.sqlite"
+
+  # Filtered, probed, and (if enabled) TMDB-enriched working streams.
+  OK_M3U: "output/ok.m3u"
+
+  # Filtered but failing streams (last probe result FAIL).
+  FAIL_M3U: "output/fail.m3u"
+
+  # Excel exports (friendly error buckets + timestamps are formatted).
+  OK_XLSX: "output/ok.xlsx"
+  FAIL_XLSX: "output/fail.xlsx"
+
+
+# --- Excel export formatting ---
+EXCEL:
+  # Max column width (characters) when auto-sizing.
+  AUTOFIT_MAX: 60
+
+  # Keep header styling minimal for speed and compatibility.
+  MINIMAL_STYLE: true
+
+  # Additionally write CSVs next to the XLSX files (same base name).
+  ADD_CSV_TOO: false
+
+
+# --- Misc behavior ---
 MISC:
+  # When true, prints less chatter while still showing important warnings.
   QUIET: false
-
-# -------- ADVANCED --------
-ADVANCED:
-  REBUILD_INDEXES: false
-  MIGRATE_STREAMS_NO_ROWID: false

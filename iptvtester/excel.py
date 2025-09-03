@@ -1,68 +1,99 @@
 # -*- coding: utf-8 -*-
-import os, pandas as pd
-from .utils import human_dt
+import math
+import os
+from typing import List, Dict
 
-def classify_error(reason: str) -> str:
-    r = (reason or "").lower()
-    if "401" in r or "403" in r or "unauthor" in r or "forbidden" in r: return "Auth/Forbidden"
-    if "404" in r or "not found" in r: return "Not Found"
-    if "timeout" in r: return "Timeout"
-    if "connection reset" in r or "eof" in r: return "Network/IO"
-    if "ssl" in r or "certificate" in r: return "TLS/SSL"
-    if "codec" in r or "invalid data" in r or "malformed" in r: return "Stream Data"
+import pandas as pd
+
+# --------- helpers ---------
+
+def classify_error(note: str) -> str:
+    n = (note or "").lower()
+    if not n:
+        return ""
+    if "timeout" in n or "timed out" in n:
+        return "Timeout"
+    if "403" in n:
+        return "HTTP 403"
+    if "401" in n:
+        return "HTTP 401"
+    if "404" in n:
+        return "HTTP 404"
+    if "connection refused" in n or "could not connect" in n:
+        return "Connect error"
+    if "decode" in n or "codec" in n:
+        return "Probe decode"
     return "Other"
 
-def _auto_widths(df: pd.DataFrame, max_width=60):
-    widths=[]
-    for col in df.columns:
-        h=len(str(col))
-        try:
-            s=df[col].astype(str).str.len().max(); s=0 if pd.isna(s) else int(s)
-        except Exception: s=20
-        widths.append(min(max_width, max(h,s)+2))
-    return widths
+def _safe_epoch_series(ser):
+    """
+    Coerce to numeric *seconds* since epoch; drop NaN/inf; clamp to sane range.
+    Range used: [0, 4102444800] (year 2100).
+    Anything outside → NaT.
+    """
+    s = pd.to_numeric(ser, errors="coerce")
+    # replace +/-inf with NaN
+    s = s.where(~(s == float("inf")), other=pd.NA)
+    s = s.where(~(s == float("-inf")), other=pd.NA)
+    # clamp range
+    s = s.where((s >= 0) & (s <= 4102444800), other=pd.NA)
+    return s
 
-def _write_xlsxwriter(df: pd.DataFrame, path: str, sheetname: str, max_width: int, minimal_style: bool):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    widths=_auto_widths(df, max_width=max_width)
-    with pd.ExcelWriter(
-        path,
-        engine="xlsxwriter",
-        engine_kwargs={"options": {"strings_to_urls": False}}
-    ) as writer:
-        df.to_excel(writer, index=False, sheet_name=sheetname)
-        wb=writer.book; ws=writer.sheets[sheetname]
-        if minimal_style:
-            header_fmt=wb.add_format({"bold":True,"valign":"vcenter"})
-            for colx,col_name in enumerate(df.columns):
-                ws.write(0,colx,col_name,header_fmt)
-        for colx,w in enumerate(widths): ws.set_column(colx,colx,w)
-        ws.freeze_panes(1,0); ws.autofilter(0,0, df.shape[0], df.shape[1]-1)
+def _format_time_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for col in cols:
+        if col in df.columns:
+            s = _safe_epoch_series(df[col])
+            dt = pd.to_datetime(s, unit="s", errors="coerce", utc=True)
+            # display as naive local time (no tz) for Excel compatibility
+            df[col] = dt.dt.tz_convert(None)
+    return df
 
-def export(ok_rows, fail_rows, cfg):
-    def build_df(rows):
-        if not rows:
-            return pd.DataFrame(columns=["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"])
-        df=pd.DataFrame(rows).rename(columns={"TMDB Logo":"Logo"})
-        for col in ["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"]:
-            if col not in df.columns: df[col]=""
-        df["Last OK"]=df["Last OK"].map(human_dt); df["Last Checked"]=df["Last Checked"].map(human_dt)
-        return df[["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"]]
+def build_ok_df(rows: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=[
+        "Group", "Title", "Last OK", "Last Checked", "Fail Count", "URL", "TMDB Logo"
+    ])
+    df = _format_time_cols(df, ["Last OK", "Last Checked"])
+    return df
 
-    df_ok=build_df(ok_rows)
-    df_fail=build_df(fail_rows)
-    if not df_ok.empty: df_ok=df_ok.sort_values(by=["Group","Title"], kind="stable")
-    if not df_fail.empty:
-        df_fail=df_fail.sort_values(by=["Error Category","Fail Count","Group","Title"],
-                                    ascending=[True,False,True,True], kind="stable")
+def build_fail_df(rows: List[Dict]) -> pd.DataFrame:
+    df = pd.DataFrame(rows, columns=[
+        "Group", "Title", "Last OK", "Last Checked", "Fail Count",
+        "Error Category", "Reason", "URL", "TMDB Logo"
+    ])
+    df = _format_time_cols(df, ["Last OK", "Last Checked"])
+    return df
 
-    out = cfg["OUTPUTS"]; ex = cfg["EXCEL"]
-    if ex.get("ADD_CSV_TOO", False):
-        okb,_ = os.path.splitext(out["OK_XLSX"]); failb,_ = os.path.splitext(out["FAIL_XLSX"])
-        df_ok.to_csv(okb + ".csv", index=False, encoding="utf-8")
-        df_fail.to_csv(failb + ".csv", index=False, encoding="utf-8")
+# --------- export ---------
 
-    _write_xlsxwriter(df_ok, out["OK_XLSX"], "OK", ex["AUTOFIT_MAX"], ex["MINIMAL_STYLE"])
-    _write_xlsxwriter(df_fail, out["FAIL_XLSX"], "FAIL", ex["AUTOFIT_MAX"], ex["MINIMAL_STYLE"])
-    print(f"📊 Excel (OK)   → {out['OK_XLSX']}")
-    print(f"📊 Excel (FAIL) → {out['FAIL_XLSX']}")
+def export(ok_rows: List[Dict], fail_rows: List[Dict], cfg: Dict):
+    out_ok   = cfg["OUTPUTS"]["OK_XLSX"]
+    out_fail = cfg["OUTPUTS"]["FAIL_XLSX"]
+    excel_cfg = cfg.get("EXCEL", {}) or {}
+    add_csv = bool(excel_cfg.get("ADD_CSV_TOO", False))
+
+    os.makedirs(os.path.dirname(out_ok) or ".", exist_ok=True)
+
+    df_ok = build_ok_df(ok_rows)
+    df_fail = build_fail_df(fail_rows)
+
+    # XlsxWriter (fast, robust). Avoid unsupported kwargs.
+    with pd.ExcelWriter(out_ok, engine="xlsxwriter") as writer:
+        df_ok.to_excel(writer, sheet_name="Working Streams", index=False)
+        # minimal formatting
+        ws = writer.sheets["Working Streams"]
+        for i, col in enumerate(df_ok.columns):
+            width = min(max(12, int(df_ok[col].astype(str).str.len().quantile(0.95)) + 2),
+                        int(cfg.get("EXCEL", {}).get("AUTOFIT_MAX", 60)))
+            ws.set_column(i, i, width)
+
+    with pd.ExcelWriter(out_fail, engine="xlsxwriter") as writer:
+        df_fail.to_excel(writer, sheet_name="Failed Streams", index=False)
+        ws = writer.sheets["Failed Streams"]
+        for i, col in enumerate(df_fail.columns):
+            width = min(max(12, int(df_fail[col].astype(str).str.len().quantile(0.95)) + 2),
+                        int(cfg.get("EXCEL", {}).get("AUTOFIT_MAX", 60)))
+            ws.set_column(i, i, width)
+
+    if add_csv:
+        df_ok.to_csv(out_ok.replace(".xlsx", ".csv"), index=False, encoding="utf-8")
+        df_fail.to_csv(out_fail.replace(".xlsx", ".csv"), index=False, encoding="utf-8")
