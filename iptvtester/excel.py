@@ -1,68 +1,124 @@
 # -*- coding: utf-8 -*-
-import os, pandas as pd
-from .utils import human_dt
+from __future__ import annotations
+import math
+import os
+from typing import List, Dict
+
+import pandas as pd
+
+
+# -------- helpers --------
+
+def _safe_epoch_series(ser: pd.Series) -> pd.Series:
+    """
+    Guard against None/NaN/inf/huge values before to_datetime(unit='s').
+    """
+    def clamp(v):
+        try:
+            if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+                return None
+            iv = int(v)
+            # sensible bounds: [1970 .. 2100-01-01]
+            if iv < 0 or iv > 4102444800:
+                return None
+            return iv
+        except Exception:
+            return None
+    return ser.map(clamp)
+
+
+def _format_time_cols(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    for c in cols:
+        if c in df.columns:
+            ser = _safe_epoch_series(df[c])
+            dts = pd.to_datetime(ser, unit="s", errors="coerce", utc=True)
+            df[c] = dts.dt.tz_convert(None)  # naive local time
+    return df
+
+
+# -------- optional error bucketing --------
 
 def classify_error(reason: str) -> str:
-    r = (reason or "").lower()
-    if "401" in r or "403" in r or "unauthor" in r or "forbidden" in r: return "Auth/Forbidden"
-    if "404" in r or "not found" in r: return "Not Found"
-    if "timeout" in r: return "Timeout"
-    if "connection reset" in r or "eof" in r: return "Network/IO"
-    if "ssl" in r or "certificate" in r: return "TLS/SSL"
-    if "codec" in r or "invalid data" in r or "malformed" in r: return "Stream Data"
+    """
+    Classify probe error strings into friendlier buckets for Excel.
+    """
+    if not reason:
+        return "Unknown"
+
+    r = reason.lower()
+    if "timeout" in r:
+        return "Timeout"
+    if "not found" in r or "404" in r:
+        return "Not Found"
+    if "connection" in r or "refused" in r or "reset" in r:
+        return "Connection Error"
+    if "codec" in r or "format" in r:
+        return "Unsupported Format"
     return "Other"
 
-def _auto_widths(df: pd.DataFrame, max_width=60):
-    widths=[]
-    for col in df.columns:
-        h=len(str(col))
-        try:
-            s=df[col].astype(str).str.len().max(); s=0 if pd.isna(s) else int(s)
-        except Exception: s=20
-        widths.append(min(max_width, max(h,s)+2))
-    return widths
 
-def _write_xlsxwriter(df: pd.DataFrame, path: str, sheetname: str, max_width: int, minimal_style: bool):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    widths=_auto_widths(df, max_width=max_width)
-    with pd.ExcelWriter(
-        path,
-        engine="xlsxwriter",
-        engine_kwargs={"options": {"strings_to_urls": False}}
-    ) as writer:
-        df.to_excel(writer, index=False, sheet_name=sheetname)
-        wb=writer.book; ws=writer.sheets[sheetname]
-        if minimal_style:
-            header_fmt=wb.add_format({"bold":True,"valign":"vcenter"})
-            for colx,col_name in enumerate(df.columns):
-                ws.write(0,colx,col_name,header_fmt)
-        for colx,w in enumerate(widths): ws.set_column(colx,colx,w)
-        ws.freeze_panes(1,0); ws.autofilter(0,0, df.shape[0], df.shape[1]-1)
+# -------- builders --------
 
-def export(ok_rows, fail_rows, cfg):
-    def build_df(rows):
-        if not rows:
-            return pd.DataFrame(columns=["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"])
-        df=pd.DataFrame(rows).rename(columns={"TMDB Logo":"Logo"})
-        for col in ["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"]:
-            if col not in df.columns: df[col]=""
-        df["Last OK"]=df["Last OK"].map(human_dt); df["Last Checked"]=df["Last Checked"].map(human_dt)
-        return df[["Group","Title","Last OK","Last Checked","Fail Count","Error Category","Reason","URL","Logo"]]
+def build_ok_df(rows: List[Dict]) -> pd.DataFrame:
+    """
+    rows: list of dicts describing OK streams (after enrichment), at least:
+      url, display_title, group-title, tvg-logo, last_ok, last_checked
+    """
+    recs = []
+    for r in rows:
+        recs.append({
+            "Title": r.get("display_title") or r.get("tvg-name") or r.get("title") or "",
+            "Group": r.get("group-title") or "",
+            "Logo": r.get("tvg-logo") or "",
+            "URL": r.get("url") or "",
+            "Last OK": r.get("last_ok"),
+            "Last Checked": r.get("last_checked"),
+        })
+    df = pd.DataFrame(recs)
+    df = _format_time_cols(df, ["Last OK", "Last Checked"])
+    return df
 
-    df_ok=build_df(ok_rows)
-    df_fail=build_df(fail_rows)
-    if not df_ok.empty: df_ok=df_ok.sort_values(by=["Group","Title"], kind="stable")
-    if not df_fail.empty:
-        df_fail=df_fail.sort_values(by=["Error Category","Fail Count","Group","Title"],
-                                    ascending=[True,False,True,True], kind="stable")
 
-    out = cfg["OUTPUTS"]; ex = cfg["EXCEL"]
-    if ex.get("ADD_CSV_TOO", False):
-        okb,_ = os.path.splitext(out["OK_XLSX"]); failb,_ = os.path.splitext(out["FAIL_XLSX"])
-        df_ok.to_csv(okb + ".csv", index=False, encoding="utf-8")
-        df_fail.to_csv(failb + ".csv", index=False, encoding="utf-8")
+def build_fail_df(rows: List[Dict]) -> pd.DataFrame:
+    """
+    rows: list of dicts describing FAIL streams, with probe errors if available.
+    """
+    recs = []
+    for r in rows:
+        reason = r.get("probe_error") or r.get("error") or ""
+        recs.append({
+            "Title": r.get("display_title") or r.get("tvg-name") or r.get("title") or "",
+            "Group": r.get("group-title") or "",
+            "URL": r.get("url") or "",
+            "Reason": reason,
+            "Bucket": classify_error(reason),
+            "Last OK": r.get("last_ok"),
+            "Last Checked": r.get("last_checked"),
+        })
+    df = pd.DataFrame(recs)
+    df = _format_time_cols(df, ["Last OK", "Last Checked"])
+    return df
 
-    _write_xlsxwriter(df_ok, out["OK_XLSX"], "OK", ex["AUTOFIT_MAX"], ex["MINIMAL_STYLE"])
-    _write_xlsxwriter(df_fail, out["FAIL_XLSX"], "FAIL", ex["AUTOFIT_MAX"], ex["MINIMAL_STYLE"])
-    print(f"📊 Excel (OK)   → {out['OK_XLSX']}")
-    print(f"📊 Excel (FAIL) → {out['FAIL_XLSX']}")
+
+# -------- writer --------
+
+def export(ok_rows: List[Dict], fail_rows: List[Dict], cfg: Dict):
+    """
+    Write Excel files for OK and FAIL inventories.
+      cfg["OUTPUT_XLSX_OK"], cfg["OUTPUT_XLSX_FAIL"]
+    """
+    x_ok = cfg.get("OUTPUT_XLSX_OK", "output/ok.xlsx")
+    x_fail = cfg.get("OUTPUT_XLSX_FAIL", "output/fail.xlsx")
+    os.makedirs(os.path.dirname(x_ok) or ".", exist_ok=True)
+    os.makedirs(os.path.dirname(x_fail) or ".", exist_ok=True)
+
+    df_ok = build_ok_df(ok_rows)
+    df_fail = build_fail_df(fail_rows)
+
+    # xlsxwriter; avoid unsupported 'options=' argument on some pandas versions
+    with pd.ExcelWriter(x_ok, engine="xlsxwriter") as writer:
+        df_ok.to_excel(writer, sheet_name="Working Streams", index=False)
+
+    with pd.ExcelWriter(x_fail, engine="xlsxwriter") as writer:
+        df_fail.to_excel(writer, sheet_name="Failed Streams", index=False)
+

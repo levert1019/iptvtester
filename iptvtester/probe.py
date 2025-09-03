@@ -1,52 +1,118 @@
 # -*- coding: utf-8 -*-
-import os, json, subprocess
+"""
+Probe streams with ffprobe.
+Annotates each item with:
+  status = "OK"/"FAIL"
+  last_ok = epoch (if OK)
+  last_checked = epoch
+  probe_error = string (if FAIL)
+
+Features:
+- Parallel probing (PROBE.PARALLELISM)
+- Periodic progress logs (every N items)
+- Graceful Ctrl+C: returns partial results gathered so far
+"""
+
+from __future__ import annotations
+import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from .utils import tick_progress
+from typing import List, Dict, Tuple
 
-def ffprobe_ok(url: str, timeout_s: int):
-    cmd = [
-        "ffprobe", "-v", "error",
-        "-select_streams", "v:0",
-        "-show_entries", "stream=codec_name,width,height",
-        "-show_entries", "format=duration",
-        "-of", "json",
-        url
-    ]
-    creationflags = 0x08000000 if os.name == "nt" else 0
+
+def _probe_one(item: Dict, cfg: Dict) -> Dict:
+    url = item.get("url")
+    ffprobe_path = cfg.get("PROBE", {}).get("FFPROBE_PATH", "ffprobe")
+    timeout = int(cfg.get("PROBE", {}).get("TIMEOUT", 10))
+    now = int(time.time())
+
     try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=min(timeout_s, 10), check=False, creationflags=creationflags)
-        if p.returncode != 0:
-            reason = (p.stderr.decode(errors="ignore") or "ffprobe error").strip()
-            return False, reason
-        data = json.loads(p.stdout.decode("utf-8", errors="ignore") or "{}")
-        if not (data.get("streams") and data["streams"][0].get("codec_name")):
-            return False, "No video stream"
-        return True, "OK"
+        # Keep it light: check first video stream codec_name; errors imply not playable
+        cmd = [
+            ffprobe_path,
+            "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=codec_name",
+            "-of", "default=nokey=1:noprint_wrappers=1",
+            url,
+        ]
+        subprocess.run(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=True,
+        )
+        item["status"] = "OK"
+        item["last_ok"] = now
+        item["last_checked"] = now
+        item["probe_error"] = ""
     except subprocess.TimeoutExpired:
-        return False, "ffprobe timeout"
+        item["status"] = "FAIL"
+        item["last_checked"] = now
+        item["probe_error"] = "Timeout"
+    except subprocess.CalledProcessError as e:
+        item["status"] = "FAIL"
+        item["last_checked"] = now
+        msg = ""
+        try:
+            msg = e.stderr.decode(errors="ignore").strip()
+        except Exception:
+            pass
+        item["probe_error"] = msg or "ffprobe error"
     except Exception as e:
-        return False, f"{type(e).__name__}: {e}"
+        item["status"] = "FAIL"
+        item["last_checked"] = now
+        item["probe_error"] = str(e)
 
-def run_probe(items, parallelism, timeout_s, show_each=False, quiet=False):
-    results = []
+    return item
+
+
+def probe_streams(items: List[Dict], cfg: Dict) -> Tuple[List[Dict], List[Dict]]:
     total = len(items)
-    if parallelism <= 1:
-        for i, it in enumerate(items, 1):
-            ok, note = ffprobe_ok(it['url'], timeout_s)
-            if show_each and not quiet:
-                print(f"▶ [{i}/{total}] {it.get('group-title','')} | {it.get('title')}: {'OK' if ok else 'FAIL'} ({note})")
-            results.append((it, ok, note))
-            tick_progress(i, total, prefix="   • Probe:", quiet=quiet)
-        return results
+    if total == 0:
+        return [], []
 
-    with ThreadPoolExecutor(max_workers=parallelism) as ex:
-        futs = {ex.submit(ffprobe_ok, it['url'], timeout_s): it for it in items}
-        done = 0
-        for fut in as_completed(futs):
-            ok, note = fut.result()
-            it = futs[fut]
-            results.append((it, ok, note))
-            done += 1
-            tick_progress(done, total, prefix="   • Probe:", quiet=quiet)
-    return results
+    parallelism = max(1, int(cfg.get("PROBE", {}).get("PARALLELISM", 16)))
+    tick = max(100, int(cfg.get("PROBE", {}).get("PROGRESS_EVERY", 1000)))  # print every N completions
+
+    ok: List[Dict] = []
+    fail: List[Dict] = []
+
+    completed = 0
+    last_print = 0
+
+    print(f"🧪 Probing now: {total} (parallel={parallelism})")
+
+    # We’ll handle Ctrl+C and return partial results
+    try:
+        with ThreadPoolExecutor(max_workers=parallelism) as ex:
+            futs = [ex.submit(_probe_one, it, cfg) for it in items]
+            for fut in as_completed(futs):
+                try:
+                    item = fut.result()
+                except KeyboardInterrupt:
+                    # Main thread interrupt — cancel remaining futures
+                    ex.shutdown(wait=False, cancel_futures=True)
+                    break
+                except Exception as e:
+                    # Should be rare; mark as FAIL
+                    item = None
+
+                if item is not None:
+                    if item.get("status") == "OK":
+                        ok.append(item)
+                    else:
+                        fail.append(item)
+
+                completed += 1
+                if completed - last_print >= tick or completed == total:
+                    last_print = completed
+                    # Simple progress line
+                    print(f"   • Probe: [{completed}/{total}]")
+
+    except KeyboardInterrupt:
+        # Ctrl+C during scheduling/as_completed setup
+        print("⏹️  Probing interrupted by user (Ctrl+C). Returning partial results…")
+
+    return ok, fail

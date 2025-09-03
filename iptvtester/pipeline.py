@@ -1,170 +1,229 @@
 # -*- coding: utf-8 -*-
-from datetime import datetime, timedelta
-from dateutil.tz import tzlocal
-from .http_client import load_m3u_text
-from .m3u import parse, write
-from .db import (open_main, ingest_stage_merge, assign_unique_titles, fetch_all_streams,
-                 save_probe_results, meta_get, meta_set, drop_indexes, create_indexes,
-                 migrate_without_rowid)
-from .probe import run_probe
-from .tmdb import enrich
-from .excel import export, classify_error
-from .utils import sha1_text
+from __future__ import annotations
+import fnmatch
+import os
+import re
+import sys
+import time
+from collections import Counter
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
-def _passes_filters(it, cfg):
-    grp = it.get("group-title","")
-    gf = cfg["GROUP_FILTERS"]
-    inc = gf.get("INCLUDE_GROUPS") or []
-    exc = gf.get("EXCLUDE_GROUPS") or []
-    def match_any(name, needles):
-        n = (name or "").lower()
-        return any(s.lower() in n for s in needles)
-    if inc and not match_any(grp, inc): return False
-    if exc and match_any(grp, exc):     return False
-    return True
+import requests
 
-def _needs_check(row):
-    if not row: return True
-    last = row.get("last_checked")
-    if not last: return True
+from .m3u import parse as parse_m3u, write as write_m3u
+from .tmdb import enrich as tmdb_enrich
+from .excel import export as export_excel
+
+# ---- probe import is REQUIRED when PROBE.ENABLED = True
+try:
+    from .probe import probe_streams  # signature: probe_streams(items, cfg) -> (ok_items, fail_items)
+except Exception as _e:
+    probe_streams = None
+    _probe_import_error = _e
+else:
+    _probe_import_error = None
+
+
+def _is_url(s: str) -> bool:
     try:
-        dt = datetime.fromisoformat(last)
-        if datetime.now(tzlocal()) - dt > timedelta(days=1):
-            return True
+        p = urlparse(s or "")
+        return p.scheme in ("http", "https") and bool(p.netloc)
     except Exception:
-        return True
-    return row.get("status") != "OK"
+        return False
 
-def run_once(cfg):
-    if not cfg["MISC"]["QUIET"]:
-        print("🚀 Start IPTV-Tester")
 
-    # Load playlist text
-    text = load_m3u_text(cfg, cfg["SOURCE_M3U"], cfg["_CLI_HTTP"])
+def _download_text(url: str, cfg: Dict) -> str:
+    """Download M3U text using config HTTP settings, with UA rotation."""
+    verify = bool(cfg.get("HTTP_VERIFY_TLS", True))
+    timeout = int(cfg.get("HTTP_TIMEOUT", 10))
+    base_ua = cfg.get("HTTP_UA") or "VLC/3.0.18 LibVLC/3.0.18"
 
-    # DB
-    con = open_main(cfg["OUTPUTS"]["DB_PATH"], defer_indexes=cfg["ADVANCED"]["REBUILD_INDEXES"])
-    if cfg["ADVANCED"]["MIGRATE_STREAMS_NO_ROWID"]:
-        print("🔧 Migrating streams → WITHOUT ROWID …")
-        migrate_without_rowid(con)
+    uas = [
+        base_ua,
+        "Dalvik/2.1.0 (Linux; U; Android 9; IPTV Smarters Pro)",
+        "Kodi/20.0 (Windows NT 10.0; Win64; x64)",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/117.0.0.0 Safari/537.36",
+    ]
+    sess = requests.Session()
+    sess.headers.update({"Accept": "*/*", "Accept-Encoding": "gzip, deflate"})
+    last_status = None
+    last_exc = None
+    for ua in uas:
+        try:
+            sess.headers["User-Agent"] = ua
+            r = sess.get(url, timeout=timeout, verify=verify, allow_redirects=True)
+            if r.status_code != 200:
+                last_status = r.status_code
+                print(f"HTTP {r.status_code} with UA={ua}")
+                continue
+            return r.text or ""
+        except Exception as e:
+            last_exc = e
+            continue
+    if last_exc:
+        raise OSError(f"Download failed: {last_exc}")
+    raise OSError(f"Download failed (last status {last_status})")
 
-    # SHA-1
-    last_hash = meta_get(con, "last_playlist_sha1")
-    curr_hash = sha1_text(text)
 
-    # Parse & filter
-    items = parse(text)
-    if not cfg["MISC"]["QUIET"]:
+def _load_m3u_text(cfg: Dict, src: str) -> str:
+    if _is_url(src):
+        return _download_text(src, cfg)
+    if not os.path.isfile(src):
+        raise FileNotFoundError(f"M3U file not found: {src}")
+    with open(src, "r", encoding="utf-8", errors="ignore") as f:
+        return f.read()
+
+
+# -------------------- GROUP FILTERING --------------------
+
+_PREFIX_RE = re.compile(r'^\s*\|?([A-Z]{2,4})\|?\s*[-|]\s*', re.IGNORECASE)
+
+def _detect_prefix(group_title: str) -> str:
+    if not group_title:
+        return ""
+    m = _PREFIX_RE.match(group_title)
+    return (m.group(1).upper() if m else "").strip()
+
+def _norm(s: str) -> str:
+    # normalize whitespace, casing, and fancy dashes/pipes
+    s = (s or "").strip()
+    s = s.replace("—", "-").replace("–", "-").replace("│", "|").replace("¦", "|")
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+def _match_group(g: str, patterns: List[str], mode: str) -> bool:
+    gl = _norm(g).lower()
+    pats = [_norm(p).lower() for p in patterns]
+    if mode == "equals":
+        return any(gl == p for p in pats)
+    if mode == "substring":
+        return any(p in gl for p in pats)
+    if mode == "regex":
+        return any(re.search(p, gl) for p in pats)
+    if mode == "glob":
+        return any(fnmatch.fnmatch(gl, p) for p in pats)
+    return any(p in gl for p in pats)
+
+def _filter_items_by_groups(items: List[Dict], cfg: Dict) -> List[Dict]:
+    filt = cfg.get("FILTER", {}) or {}
+    include_groups = filt.get("INCLUDE_GROUPS") or []
+    include_prefixes = [p.upper() for p in (filt.get("INCLUDE_PREFIXES") or [])]
+    mode = (filt.get("MODE") or "substring").strip().lower()
+    process_only = bool(filt.get("PROCESS_ONLY_INCLUDED_GROUPS", False))
+
+    if not include_groups and not include_prefixes:
+        print("🧰 Filter: no INCLUDE_GROUPS or INCLUDE_PREFIXES configured → processing all parsed entries.")
+        return items
+
+    kept, dropped = [], 0
+    for it in items:
+        g = it.get("group-title") or it.get("raw_group") or ""
+        pref = _detect_prefix(g)
+        ok = False
+        if include_prefixes and pref:
+            if pref in include_prefixes:
+                ok = True
+        if not ok and include_groups:
+            if _match_group(g, include_groups, mode):
+                ok = True
+        if ok:
+            kept.append(it)
+        else:
+            dropped += 1
+
+    if not kept:
+        uniq = Counter(_norm(x.get("group-title") or x.get("raw_group") or "") for x in items)
+        print("⚠️  Filter kept 0 items. Here are the top 20 group-title samples I saw:")
+        for name, count in uniq.most_common(20):
+            print(f"   • {name}   (x{count})")
+        print("   Tip: set FILTER.MODE to 'substring' or 'glob', or use INCLUDE_PREFIXES: ['EN','EX','EXYU','DE']")
+
+    if process_only:
+        print(f"🧰 Filter: active (process_only=True) → kept {len(kept)}, dropped {dropped}.")
+        return kept
+    else:
+        print(f"🧰 Filter: present (process_only=False) → keeping ALL ({len(items)}). Matched={len(kept)}, non-matching={dropped}.")
+        return items
+
+
+# -------------------- PROBING / ENRICH / EXPORT --------------------
+
+def _split_ok_fail_after_probe(items: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    ok, fail = [], []
+    for it in items:
+        st = (it.get("status") or "").upper()
+        if st == "OK":
+            ok.append(it)
+        else:
+            fail.append(it)
+    return ok, fail
+
+
+def run_once(cfg: Dict) -> None:
+    print("🚀 Start IPTV-Tester")
+
+    try:
+        # 1) Load playlist text
+        src = cfg.get("SOURCE_M3U") or "input/playlist.m3u"
+        text = _load_m3u_text(cfg, src)
+
+        # 2) Parse
+        items = parse_m3u(text)
         print(f"🔎 Entries detected: {len(items)}")
 
-    gf = cfg["GROUP_FILTERS"]
-    if gf["PROCESS_ONLY_INCLUDED_GROUPS"]:
-        items = [it for it in items if _passes_filters(it, cfg)]
-        if not cfg["MISC"]["QUIET"]:
-            print(f"✅ After group filter: {len(items)}")
+        # 3) Filter by groups (deterministic & logged)
+        items = _filter_items_by_groups(items, cfg)
+        print(f"🔎 After filter: {len(items)}")
 
-    # Ingest gate
-    if last_hash != curr_hash:
-        if cfg["ADVANCED"]["REBUILD_INDEXES"]:
-            drop_indexes(con)
-        if not cfg["MISC"]["QUIET"]:
-            print("🗂️  Updating inventory DB …")
-        ingest_stage_merge(con, items, chunk=50000, quiet=cfg["MISC"]["QUIET"])
-        assign_unique_titles(con, items, chunk=50000, quiet=cfg["MISC"]["QUIET"])
-        if cfg["ADVANCED"]["REBUILD_INDEXES"]:
-            if not cfg["MISC"]["QUIET"]:
-                print("🧱 Rebuilding indexes …")
-            create_indexes(con)
-        meta_set(con, "last_playlist_sha1", curr_hash)
-        if not cfg["MISC"]["QUIET"]:
-            print("✅ Inventory updated.")
-    else:
-        if not cfg["MISC"]["QUIET"]:
-            print("⏭️  Playlist unchanged — skipping inventory update.")
+        # 4) Probe (ffprobe), if enabled
+        probe_enabled = bool(cfg.get("PROBE", {}).get("ENABLED", True))
+        if probe_enabled:
+            if probe_streams is None:
+                raise RuntimeError(
+                    "Probe is enabled but iptvtester.probe could not be imported.\n"
+                    f"Import error: {_probe_import_error}\n"
+                    "→ Ensure iptvtester/probe.py exists and defines probe_streams(items, cfg)."
+                )
+            ok_items, fail_items = probe_streams(items, cfg)
+        else:
+            print("🧪 Probe disabled by config (PROBE.ENABLED=false). Marking nothing as OK.")
+            ok_items, fail_items = [], items[:]  # everything untested remains FAIL domain until proved
 
-    # Decide probe set
-    rows = fetch_all_streams(con)
-    status_map = {r['url']: r for r in rows}
-    to_check = []
-    for it in items:
-        r = status_map.get(it['url'])
-        if r is None or _needs_check(r): to_check.append(it)
+        # 5) Stats
+        ok_n = len(ok_items)
+        fail_n = len(fail_items)
+        print(f"💾 Saved probe results: {ok_n} OK, {fail_n} FAIL")
+        print(f"📌 Summary (DB state): {ok_n} OK / {fail_n} FAIL (within filtered playlist).")
 
-    if not cfg["MISC"]["QUIET"]:
-        print(f"🧪 Probing now: {len(to_check)} (parallel={cfg['PROBE']['PARALLELISM']})")
+        # 6) TMDB enrichment for BOTH OK and FAIL (series-level, no episode API)
+        ok_items = tmdb_enrich(ok_items, cfg)
+        fail_items = tmdb_enrich(fail_items, cfg)
 
-    results = run_probe(
-        to_check,
-        parallelism=cfg["PROBE"]["PARALLELISM"],
-        timeout_s=cfg["PROBE"]["TIMEOUT_SECONDS"],
-        show_each=cfg["PROBE"]["SHOW_EACH_PROBE"],
-        quiet=cfg["MISC"]["QUIET"],
-    )
+        # 7) Write M3Us
+        out_ok = cfg.get("OUTPUT_OK_M3U") or cfg.get("OUTPUT", {}).get("OK_M3U") or "output/ok.m3u"
+        out_fail = cfg.get("OUTPUT_FAIL_M3U") or cfg.get("OUTPUT", {}).get("FAIL_M3U") or "output/fail.m3u"
+        os.makedirs(os.path.dirname(out_ok) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(out_fail) or ".", exist_ok=True)
 
-    if not cfg["MISC"]["QUIET"]:
-        print("💾 Saving results …")
-    save_probe_results(con, results, quiet=cfg["MISC"]["QUIET"])
-    if not cfg["MISC"]["QUIET"]:
-        print("✅ Probe results saved.")
-
-    # Build sets (current playlist only)
-    rows = fetch_all_streams(con)
-    status_map = {r['url']: r for r in rows}
-    in_playlist = {it['url'] for it in items}
-    ok_set   = {r['url'] for r in rows if r.get('status') == 'OK'   and r['url'] in in_playlist}
-    fail_set = {r['url'] for r in rows if r.get('status') == 'FAIL' and r['url'] in in_playlist}
-    if not cfg["MISC"]["QUIET"]:
-        print(f"📌 Summary: {len(ok_set)} OK / {len(fail_set)} FAIL in current playlist.")
-
-    items_map = {it['url']: it for it in items}
-    ok_items = [items_map[u] for u in ok_set if u in items_map]
-    ok_items = [it for it in ok_items if _passes_filters(it, cfg)]
-
-    # TMDB enrichment + auto grouping to PREFIX - Genre (or Uncategorized)
-    if cfg["TMDB"]["ENABLE"] and cfg["TMDB"]["API_KEY"] and ok_items:
-        if not cfg["MISC"]["QUIET"]:
-            print(f"🎬 TMDB enrichment (parallel) for {len(ok_items)} items …")
-        ok_items = enrich(ok_items, cfg)
-
-    # Write M3Us
-    if not cfg["MISC"]["QUIET"]:
         print("📝 Writing M3Us …")
-    write(cfg["OUTPUTS"]["OK_M3U"],   ok_items)
-    fail_items_m3u = [items_map[u] for u in fail_set if u in items_map]
-    write(cfg["OUTPUTS"]["FAIL_M3U"], fail_items_m3u)
+        write_m3u(out_ok, ok_items)
+        write_m3u(out_fail, fail_items)
 
-    # Excel rows
-    note_map = {it['url']: note for (it, ok, note) in results if not ok}
-    ok_rows = [{
-        "Group": items_map[u].get("group-title",""),
-        "Title": items_map[u].get("title",""),
-        "Last OK": status_map[u].get("last_ok","") or "",
-        "Last Checked": status_map[u].get("last_checked","") or "",
-        "Fail Count": status_map[u].get("fail_count",0) or 0,
-        "Error Category": "",
-        "Reason": "",
-        "URL": u,
-        "TMDB Logo": items_map[u].get("tvg-logo",""),
-    } for u in ok_set if u in items_map]
-
-    fail_rows = []
-    for u in fail_set:
-        it = items_map.get(u, {}); r = status_map.get(u, {})
-        note = note_map.get(u, "") or ""
-        fail_rows.append({
-            "Group": it.get("group-title",""),
-            "Title": it.get("title",""),
-            "Last OK": r.get("last_ok","") or "",
-            "Last Checked": r.get("last_checked","") or "",
-            "Fail Count": r.get("fail_count",0) or 0,
-            "Error Category": classify_error(note),
-            "Reason": note,
-            "URL": u,
-            "TMDB Logo": it.get("tvg-logo",""),
-        })
-
-    if not cfg["MISC"]["QUIET"]:
+        # 8) Excel export
         print("📗 Writing Excel …")
-    export(ok_rows, fail_rows, cfg)
-    if not cfg["MISC"]["QUIET"]:
+        export_excel(
+            ok_items,
+            fail_items,
+            {
+                "OUTPUT_XLSX_OK": cfg.get("OUTPUT_XLSX_OK") or cfg.get("OUTPUT", {}).get("XLSX_OK") or "output/ok.xlsx",
+                "OUTPUT_XLSX_FAIL": cfg.get("OUTPUT_XLSX_FAIL") or cfg.get("OUTPUT", {}).get("XLSX_FAIL") or "output/fail.xlsx",
+            },
+        )
+
         print("✅ Done. ✨")
+
+    except KeyboardInterrupt:
+        # Allow graceful exit on Ctrl+C anywhere in the pipeline
+        print("\n⏹️  Interrupted by user (Ctrl+C). Exiting cleanly.")
+        return
