@@ -1,0 +1,2 @@
+[console_scripts]
+iptvtester = iptvtester.cli:main
